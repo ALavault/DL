@@ -1,0 +1,143 @@
+name: probabilistic-attention-mnist
+
+on:
+  push:
+    branches:
+      - experiment/probabilistic-attention-mnist
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  OMP_NUM_THREADS: "4"
+  MKL_NUM_THREADS: "4"
+  OPENBLAS_NUM_THREADS: "4"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore experiment source
+        run: cat experiments/prob_attention_bundle/part-* | base64 --decode | tar -xz
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install preparation dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install --disable-pip-version-check "numpy<3" scipy
+      - name: Download canonical static binarized MNIST
+        run: |
+          mkdir -p .cache/mnist prepared
+          curl --fail --location --retry 5 --retry-delay 3 \
+            https://github.com/mgermain/MADE/releases/download/ICML2015/binarized_mnist.npz \
+            --output .cache/binarized_mnist.npz
+          test "$(stat -c%s .cache/binarized_mnist.npz)" -eq 219521332
+      - name: Download original MNIST for the held-out evaluator
+        run: |
+          base=https://ossci-datasets.s3.amazonaws.com/mnist
+          for file in \
+            train-images-idx3-ubyte.gz \
+            train-labels-idx1-ubyte.gz \
+            t10k-images-idx3-ubyte.gz \
+            t10k-labels-idx1-ubyte.gz; do
+            curl --fail --location --retry 5 --retry-delay 3 \
+              "$base/$file" --output ".cache/mnist/$file"
+          done
+      - name: Build patch tokens and train evaluator
+        run: |
+          python experiments/prob_attention_mnist/prepare.py \
+            --static-mnist .cache/binarized_mnist.npz \
+            --mnist-dir .cache/mnist \
+            --output prepared \
+            --classifier-epochs 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prepared-probabilistic-attention-mnist
+          path: prepared/
+          compression-level: 6
+          retention-days: 7
+
+  train:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        variant:
+          - fixed-prob
+          - bayes-prob
+          - bayes-logit
+          - transformer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore experiment source
+        run: cat experiments/prob_attention_bundle/part-* | base64 --decode | tar -xz
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: prepared-probabilistic-attention-mnist
+          path: prepared
+      - name: Install training dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install --disable-pip-version-check \
+            "numpy<3" scipy matplotlib
+      - name: Train and evaluate exact density
+        run: |
+          mkdir -p "results/${{ matrix.variant }}"
+          python experiments/prob_attention_mnist/train.py \
+            --variant "${{ matrix.variant }}" \
+            --prepared prepared \
+            --output "results/${{ matrix.variant }}" \
+            --batch-size 64 \
+            --sample-count 4096 \
+            --seed 20260811
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-probabilistic-attention-${{ matrix.variant }}
+          path: results/${{ matrix.variant }}/
+          compression-level: 6
+          retention-days: 14
+
+  aggregate:
+    needs: train
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore experiment source
+        run: cat experiments/prob_attention_bundle/part-* | base64 --decode | tar -xz
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-probabilistic-attention-*
+          path: collected
+      - name: Install reporting dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "numpy<3" pandas matplotlib pillow tabulate
+      - name: Consolidate cycle
+        run: |
+          mkdir -p final
+          python experiments/prob_attention_mnist/aggregate.py \
+            --input collected \
+            --output final
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-probabilistic-attention-mnist-cycle
+          path: final/
+          compression-level: 6
+          retention-days: 14
